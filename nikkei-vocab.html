@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="日経Vocab">
+<title>日経Vocab</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+JP:wght@400;600;700&family=Noto+Sans+JP:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+body{background:#0C0F14;color:#EEF2F7;font-family:'Noto Sans JP',sans-serif;min-height:100vh;overscroll-behavior:none;}
+@keyframes spin{to{transform:rotate(360deg);}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(20px);}to{opacity:1;transform:translateY(0);}}
+.spin{animation:spin 1s linear infinite;}
+.fade-up{animation:fadeUp 0.25s ease;}
+textarea:focus{outline:none;border-color:#E05A42 !important;}
+input:focus{outline:none;}
+button:active{opacity:0.75;}
+::-webkit-scrollbar{display:none;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const STORAGE_KEY = "nikkei-vocab-v1";
+const API_KEY_STORAGE = "nikkei-gemini-key";
+
+// ── Colors ────────────────────────────────────────────────────────────────────
+const C = {
+  bg:"#0C0F14", surface:"#141923", card:"#1A2235", border:"#2A3448",
+  accent:"#E05A42", accentBg:"rgba(224,90,66,0.12)",
+  text:"#EEF2F7", muted:"#7A8CA0", gold:"#DFA840",
+  cat:{
+    "経済":{fg:"#4CAF82",bg:"rgba(76,175,130,0.14)"},
+    "金融":{fg:"#5B9BD5",bg:"rgba(91,155,213,0.14)"},
+    "IT":{fg:"#9B6DD6",bg:"rgba(155,109,214,0.14)"},
+    "コンサル":{fg:"#E07845",bg:"rgba(224,120,69,0.14)"},
+    "その他":{fg:"#7A8CA0",bg:"rgba(122,140,160,0.14)"},
+  }
+};
+const catStyle = c => C.cat[c] || C.cat["その他"];
+const ff = "'Noto Sans JP',sans-serif";
+const ffS = "'Noto Serif JP',serif";
+
+// ── Storage ───────────────────────────────────────────────────────────────────
+function loadVocab(){try{const v=localStorage.getItem(STORAGE_KEY);return v?JSON.parse(v):[]}catch{return[]}}
+function saveVocab(v){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(v))}catch{}}
+function loadApiKey(){return localStorage.getItem(API_KEY_STORAGE)||""}
+function saveApiKey(k){localStorage.setItem(API_KEY_STORAGE,k)}
+
+// ── Gemini API ────────────────────────────────────────────────────────────────
+async function callGemini(prompt, apiKey, maxTokens=2000, retries=3){
+  for(let attempt=1;attempt<=retries;attempt++){
+    try{
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+        {
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({
+            contents:[{parts:[{text:prompt}]}],
+            generationConfig:{maxOutputTokens:maxTokens,temperature:0.1}
+          })
+        }
+      );
+      const raw = await res.text();
+      if(!raw||raw.trim()===""){
+        if(attempt<retries){await sleep(1000*attempt);continue;}
+        throw new Error("空レスポンス - しばらく待って再試行してください");
+      }
+      let data;
+      try{data=JSON.parse(raw)}catch(e){throw new Error("レスポンス解析失敗: "+raw.substring(0,200));}
+      if(data.error) throw new Error("APIエラー: "+(data.error.message||JSON.stringify(data.error).substring(0,200)));
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if(!text){
+        if(attempt<retries){await sleep(1000*attempt);continue;}
+        throw new Error("テキスト取得失敗: "+JSON.stringify(data).substring(0,200));
+      }
+      return text;
+    }catch(err){
+      if(attempt===retries) throw err;
+      await sleep(1000*attempt);
+    }
+  }
+}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+
+function parseJSON(text){
+  let s=text.replace(/```json\s*/g,"").replace(/```\s*/g,"").trim();
+  try{return JSON.parse(s)}catch{}
+  const m=s.match(/\{[\s\S]*\}/);
+  if(m){try{return JSON.parse(m[0])}catch{}}
+  throw new Error("JSON解析失敗");
+}
+
+function buildPrompt(text, mode){
+  if(mode==="summary"){
+    return `以下の記事テキストを要約しながら、ビジネス・経済・金融・IT・コンサルティング分野の専門用語も抽出してください。\n\n記事:\n${text}\n\n【重要】以下のJSON形式のみで回答。説明文・前置き・バッククォートは不要。JSONだけ返す。\n\n{"summary":["ポイント1","ポイント2","ポイント3","ポイント4","ポイント5"],"terms":[{"word":"専門用語","category":"経済","explanation":"社会人向け解説2〜3文","context":"この用語が含まれる記事内の文章をそのまま引用"}]}\n\nsummaryは5〜7個の箇条書きで記事の要点を押さえること。categoryは「経済」「金融」「IT」「コンサル」「その他」のいずれか。一般的な日常語は除外。`;
+  }
+  return `以下の記事テキストから、ビジネス・経済・金融・IT・コンサルティング分野の専門用語を抽出してください。\n\n記事:\n${text}\n\n【重要】以下のJSON形式のみで回答。説明文・前置き・バッククォートは不要。JSONだけ返す。\n\n{"terms":[{"word":"専門用語","category":"経済","explanation":"社会人向け解説2〜3文","context":"この用語が含まれる記事内の文章をそのまま引用"}]}\n\ncategoryは「経済」「金融」「IT」「コンサル」「その他」のいずれか。一般的な日常語は除外。`;
+}
+
+// ── DOM helpers ───────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+function el(tag, props={}, ...children){
+  const e = document.createElement(tag);
+  for(const [k,v] of Object.entries(props)){
+    if(k==="style"&&typeof v==="object") Object.assign(e.style,v);
+    else if(k.startsWith("on")) e.addEventListener(k.slice(2).toLowerCase(),v);
+    else if(k==="className") e.className=v;
+    else e.setAttribute(k,v);
+  }
+  for(const c of children){
+    if(c==null) continue;
+    e.appendChild(typeof c==="string"?document.createTextNode(c):c);
+  }
+  return e;
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let state = {
+  tab:"analyze",        // analyze | vocabulary
+  view:"input",         // input | results
+  analyzeMode:"vocab",  // vocab | summary
+  pasteText:"",
+  loading:false,
+  results:null,
+  vocab:loadVocab(),
+  modal:null,
+  wordInput:"",
+  wordLoading:false,
+  expandedWord:null,
+  catFilter:"すべて",
+  masteredFilter:"all",
+  vocabMode:"list",     // list | flash
+  flashIdx:0,
+  flashFlipped:false,
+  errorMsg:null,
+  statusMsg:"",
+  apiKey:loadApiKey(),
+  showApiSetup:!loadApiKey(),
+};
+
+function setState(patch){
+  Object.assign(state,patch);
+  render();
+}
+
+// ── Icons (SVG inline) ────────────────────────────────────────────────────────
+const icons = {
+  zap:`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>`,
+  bookmark:`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>`,
+  bookmarkFill:`<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>`,
+  x:`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`,
+  arrowLeft:`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>`,
+  loader:`<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="spin"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"></line></svg>`,
+  search:`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`,
+  trash:`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg>`,
+  chevDown:`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>`,
+  chevUp:`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"></polyline></svg>`,
+  rotate:`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 .49-4.95"></path></svg>`,
+  check:`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>`,
+  circle:`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle></svg>`,
+  key:`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path></svg>`,
+};
+function icon(name, size=20, color="currentColor"){
+  const d=el("span");
+  d.innerHTML=icons[name]||"";
+  if(d.firstChild){
+    d.firstChild.setAttribute("width",size);
+    d.firstChild.setAttribute("height",size);
+    d.style.color=color;
+    d.style.display="flex";
+    d.style.alignItems="center";
+  }
+  return d;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function catBadge(cat){
+  const {fg,bg}=catStyle(cat);
+  return el("span",{style:{fontSize:"0.62rem",padding:"2px 8px",borderRadius:"20px",background:bg,color:fg,fontWeight:"700",letterSpacing:"0.03em",whiteSpace:"nowrap"}},cat);
+}
+
+function filteredVocab(){
+  return state.vocab.slice().reverse().filter(t=>{
+    const catOk = state.catFilter==="すべて"||t.category===state.catFilter;
+    const mOk = state.masteredFilter==="all"||(state.masteredFilter==="mastered"?t.mastered:!t.mastered);
+    return catOk&&mOk;
+  });
+}
+
+// ── API Setup Screen ──────────────────────────────────────────────────────────
+function renderApiSetup(){
+  let keyVal = state.apiKey;
+  const wrap = el("div",{style:{padding:"32px 24px",display:"flex",flexDirection:"column",gap:"20px"}});
+
+  wrap.appendChild(el("div",{style:{textAlign:"center",padding:"20px 0"}},
+    el("div",{style:{display:"inline-flex",background:C.accentBg,borderRadius:"16px",padding:"20px",marginBottom:"16px"}},icon("key",32,C.accent)),
+    el("h2",{style:{fontFamily:ffS,fontSize:"1.3rem",color:C.text,marginBottom:"8px"}},"APIキーを設定"),
+    el("p",{style:{fontSize:"0.82rem",color:C.muted,lineHeight:1.8}},"Gemini APIキーを入力してください。\nキーはこのデバイスにのみ保存されます。")
+  ));
+
+  const inp = el("input",{type:"password",placeholder:"AIzaSy...",style:{
+    width:"100%",background:C.card,border:"1px solid "+C.border,borderRadius:"12px",
+    padding:"14px",color:C.text,fontSize:"0.9rem",fontFamily:ff,
+  }});
+  inp.value = keyVal;
+  inp.addEventListener("input",e=>{keyVal=e.target.value;});
+  wrap.appendChild(inp);
+
+  const hint = el("div",{style:{background:C.card,borderRadius:"12px",padding:"16px",borderLeft:"3px solid "+C.gold}},
+    el("p",{style:{fontSize:"0.76rem",color:C.muted,lineHeight:1.8}},
+      "📍 取得方法：",el("br"),
+      "1. aistudio.google.com にアクセス",el("br"),
+      "2. Googleアカウントでログイン",el("br"),
+      "3. 「Get API key」→「Create API key」"
+    )
+  );
+  wrap.appendChild(hint);
+
+  const btn = el("button",{style:{
+    width:"100%",padding:"16px",borderRadius:"12px",background:C.accent,border:"none",
+    color:"#fff",fontWeight:"700",fontSize:"0.95rem",fontFamily:ff,cursor:"pointer",
+  }},"設定して開始する");
+  btn.onclick = ()=>{
+    if(!keyVal.trim()){alert("APIキーを入力してください");return;}
+    saveApiKey(keyVal.trim());
+    setState({apiKey:keyVal.trim(),showApiSetup:false});
+  };
+  wrap.appendChild(btn);
+  return wrap;
+}
+
+// ── Analyze Tab ───────────────────────────────────────────────────────────────
+function renderAnalyze(){
+  const wrap = el("div",{style:{padding:"20px"}});
+  if(state.view==="input") return renderInput(wrap);
+  if(state.view==="results"&&state.results) return renderResults(wrap);
+  return wrap;
+}
+
+function renderInput(wrap){
+  // Mode toggle
+  const toggle = el("div",{style:{display:"flex",gap:"8px",marginBottom:"16px"}});
+  for(const {id,label} of [{id:"vocab",label:"用語抽出"},{id:"summary",label:"要約＋用語抽出"}]){
+    const active = state.analyzeMode===id;
+    const btn = el("button",{style:{
+      flex:"1",padding:"10px",borderRadius:"10px",cursor:"pointer",
+      background:active?C.accentBg:"transparent",
+      border:"1.5px solid "+(active?C.accent:C.border),
+      color:active?C.accent:C.muted,fontWeight:"700",fontSize:"0.8rem",fontFamily:ff,
+    }},label);
+    btn.onclick=()=>setState({analyzeMode:id});
+    toggle.appendChild(btn);
+  }
+  wrap.appendChild(toggle);
+
+  wrap.appendChild(el("p",{style:{margin:"0 0 14px",fontSize:"0.78rem",color:C.muted,lineHeight:1.75}},
+    state.analyzeMode==="summary"?"記事を5〜7行で要約しながら専門用語も抽出します":"日経アプリの記事本文をコピーして貼り付けてください"
+  ));
+
+  const ta = el("textarea",{placeholder:"記事本文をここに貼り付け...",style:{
+    width:"100%",height:"240px",background:C.card,border:"1px solid "+C.border,
+    borderRadius:"12px",padding:"14px",color:C.text,fontSize:"0.85rem",
+    resize:"none",fontFamily:ff,lineHeight:"1.75",
+  }});
+  ta.value = state.pasteText;
+  ta.addEventListener("input",e=>{ state.pasteText=e.target.value; });
+  wrap.appendChild(ta);
+
+  const runBtn = el("button",{style:{
+    width:"100%",marginTop:"12px",padding:"16px",borderRadius:"12px",
+    background:state.pasteText.trim()&&!state.loading?C.accent:C.border,
+    border:"none",color:"#fff",fontWeight:"700",fontSize:"0.95rem",fontFamily:ff,
+    cursor:state.pasteText.trim()&&!state.loading?"pointer":"not-allowed",
+    display:"flex",alignItems:"center",justifyContent:"center",gap:"8px",
+  }});
+  if(state.loading){
+    runBtn.appendChild(el("span",{className:"spin",style:{display:"flex"}},icon("loader",18)));
+    runBtn.appendChild(document.createTextNode("解析中..."));
+  } else {
+    runBtn.innerHTML=""; 
+    runBtn.appendChild(icon("zap",18));
+    runBtn.appendChild(document.createTextNode("AI解析を開始"));
+  }
+  runBtn.onclick = runAnalysis;
+  wrap.appendChild(runBtn);
+
+  // Settings link
+  const settingsLink = el("button",{style:{
+    background:"none",border:"none",color:C.muted,fontSize:"0.72rem",
+    fontFamily:ff,cursor:"pointer",marginTop:"16px",display:"flex",
+    alignItems:"center",gap:"4px",
+  }},icon("key",13,C.muted)," APIキーを変更");
+  settingsLink.onclick=()=>setState({showApiSetup:true});
+  wrap.appendChild(settingsLink);
+  return wrap;
+}
+
+function renderResults(wrap){
+  const r = state.results;
+
+  // Summary
+  if(r.summary&&r.summary.length>0){
+    wrap.appendChild(el("p",{style:{margin:"0 0 12px",fontSize:"0.72rem",fontWeight:"700",color:C.muted,letterSpacing:"0.08em"}},"SUMMARY"));
+    const sumBox = el("div",{style:{background:C.card,borderRadius:"14px",padding:"18px",borderLeft:"3px solid "+C.accent,marginBottom:"24px"}});
+    r.summary.forEach((pt,i)=>{
+      const row = el("div",{style:{display:"flex",gap:"10px",marginBottom:i<r.summary.length-1?"12px":"0"}});
+      row.appendChild(el("span",{style:{color:C.accent,fontWeight:"700",fontSize:"0.8rem",flexShrink:"0",marginTop:"2px"}},(i+1)+""));
+      row.appendChild(el("p",{style:{margin:"0",fontSize:"0.84rem",color:C.text,lineHeight:"1.8"}},pt));
+      sumBox.appendChild(row);
+    });
+    wrap.appendChild(sumBox);
+  }
+
+  // Terms
+  wrap.appendChild(el("p",{style:{margin:"0 0 12px",fontSize:"0.72rem",fontWeight:"700",color:C.muted,letterSpacing:"0.08em"}},"EXTRACTED TERMS"));
+  (r.terms||[]).forEach(term=>{
+    const saved = state.vocab.some(v=>v.word===term.word);
+    const card = el("div",{style:{
+      background:C.card,borderRadius:"14px",padding:"16px",marginBottom:"10px",
+      border:"1px solid "+(saved?C.accent:C.border),
+      borderLeft:"3px solid "+(saved?C.accent:C.border),cursor:"pointer",
+    }});
+    card.onclick=()=>openModal(term);
+    const top = el("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"8px"}});
+    const left = el("div",{style:{display:"flex",alignItems:"center",gap:"8px",flexWrap:"wrap"}});
+    left.appendChild(el("span",{style:{fontFamily:ffS,fontSize:"1rem",fontWeight:"700",color:C.text}},term.word));
+    left.appendChild(catBadge(term.category));
+    top.appendChild(left);
+    const saveBtn = el("button",{style:{
+      background:saved?C.accentBg:"transparent",border:"1px solid "+(saved?C.accent:C.border),
+      borderRadius:"8px",padding:"4px 10px",cursor:"pointer",color:saved?C.accent:C.muted,
+      fontSize:"0.68rem",fontWeight:"600",display:"flex",alignItems:"center",gap:"4px",flexShrink:"0",
+    }});
+    saveBtn.innerHTML=(saved?icons.bookmarkFill:icons.bookmark).replace('width="20" height="20"','width="11" height="11"');
+    saveBtn.appendChild(document.createTextNode(saved?"保存済":"保存"));
+    saveBtn.onclick=e=>{e.stopPropagation();toggleSave(term);};
+    top.appendChild(saveBtn);
+    card.appendChild(top);
+    card.appendChild(el("p",{style:{fontSize:"0.8rem",color:C.muted,lineHeight:"1.75",margin:"0"}},term.explanation));
+    wrap.appendChild(card);
+  });
+
+  // Article text
+  if(r.article_text){
+    const divider = el("div",{style:{marginTop:"28px",paddingTop:"20px",borderTop:"1px solid "+C.border}});
+    divider.appendChild(el("p",{style:{margin:"0 0 4px",fontSize:"0.72rem",fontWeight:"700",color:C.muted,letterSpacing:"0.08em"}},"ARTICLE TEXT"));
+    divider.appendChild(el("p",{style:{margin:"0 0 14px",fontSize:"0.73rem",color:C.muted}},
+      el("span",{style:{color:C.accent,fontWeight:"700"}},"赤字")," の用語をタップすると解説を表示"
+    ));
+    const artBox = el("div",{style:{background:C.card,borderRadius:"12px",padding:"18px"}});
+    const termWords = (r.terms||[]).map(t=>t.word);
+    r.article_text.split("\n").filter(p=>p.trim()).forEach(para=>{
+      const p = el("p",{style:{marginBottom:"1.1em",lineHeight:"1.9",fontSize:"0.85rem",color:C.text}});
+      let segs=[para];
+      termWords.forEach(tw=>{
+        segs=segs.flatMap(s=>{
+          if(typeof s!=="string") return [s];
+          return s.split(tw).reduce((acc,part,i)=>{if(i>0)acc.push({word:tw});acc.push(part);return acc;},[]);
+        });
+      });
+      segs.forEach(seg=>{
+        if(typeof seg==="string"){p.appendChild(document.createTextNode(seg));}
+        else{
+          const sp=el("span",{style:{color:C.accent,textDecoration:"underline dotted",cursor:"pointer",fontWeight:"700"}},seg.word);
+          sp.onclick=()=>openModal(r.terms.find(t=>t.word===seg.word));
+          p.appendChild(sp);
+        }
+      });
+      artBox.appendChild(p);
+    });
+    divider.appendChild(artBox);
+    wrap.appendChild(divider);
+  }
+
+  // Custom word lookup
+  const lookupBox = el("div",{style:{marginTop:"20px",background:C.card,borderRadius:"12px",padding:"16px"}});
+  lookupBox.appendChild(el("p",{style:{margin:"0 0 10px",fontSize:"0.78rem",fontWeight:"600",color:C.muted}},"他の単語を調べる"));
+  const row = el("div",{style:{display:"flex",gap:"8px"}});
+  const inp = el("input",{type:"text",placeholder:"調べたい単語を入力...",style:{
+    flex:"1",background:C.surface,border:"1px solid "+C.border,borderRadius:"8px",
+    padding:"10px 12px",color:C.text,fontSize:"0.85rem",fontFamily:ff,
+  }});
+  inp.value=state.wordInput;
+  inp.addEventListener("input",e=>{state.wordInput=e.target.value;});
+  inp.addEventListener("keydown",e=>{if(e.key==="Enter")searchWord();});
+  const searchBtn = el("button",{style:{
+    background:C.accent,border:"none",borderRadius:"8px",padding:"10px 14px",
+    cursor:"pointer",display:"flex",alignItems:"center",color:"#fff",
+  }});
+  searchBtn.innerHTML=state.wordLoading?icons.loader.replace('width="28" height="28"','width="16" height="16"'):icons.search;
+  searchBtn.onclick=searchWord;
+  row.appendChild(inp); row.appendChild(searchBtn);
+  lookupBox.appendChild(row);
+  wrap.appendChild(lookupBox);
+  return wrap;
+}
+
+// ── Vocabulary Tab ────────────────────────────────────────────────────────────
+function renderVocabulary(){
+  if(state.vocabMode==="flash") return renderFlash();
+  const wrap = el("div",{style:{padding:"20px"}});
+  const fv = filteredVocab();
+
+  if(state.vocab.length>0){
+    // Category filter
+    const catRow = el("div",{style:{display:"flex",gap:"6px",overflowX:"auto",paddingBottom:"4px",marginBottom:"10px"}});
+    for(const cat of ["すべて","経済","金融","IT","コンサル","その他"]){
+      const active=state.catFilter===cat;
+      const {fg,bg}=cat==="すべて"?{fg:C.accent,bg:C.accentBg}:catStyle(cat);
+      const btn=el("button",{style:{
+        flexShrink:"0",padding:"5px 12px",borderRadius:"20px",fontSize:"0.72rem",
+        fontWeight:"700",fontFamily:ff,cursor:"pointer",
+        background:active?bg:"transparent",border:"1px solid "+(active?fg:C.border),
+        color:active?fg:C.muted,
+      }},cat);
+      btn.onclick=()=>setState({catFilter:cat});
+      catRow.appendChild(btn);
+    }
+    wrap.appendChild(catRow);
+
+    // Mastered filter
+    const mRow = el("div",{style:{display:"flex",gap:"8px",marginBottom:"16px"}});
+    for(const {id,label} of [{id:"all",label:"全て"},{id:"learning",label:"学習中"},{id:"mastered",label:"習得済み"}]){
+      const active=state.masteredFilter===id;
+      const btn=el("button",{style:{
+        padding:"4px 12px",borderRadius:"20px",fontSize:"0.7rem",fontWeight:"600",
+        fontFamily:ff,cursor:"pointer",
+        background:active?C.accentBg:"transparent",border:"1px solid "+(active?C.accent:C.border),
+        color:active?C.accent:C.muted,
+      }},label);
+      btn.onclick=()=>setState({masteredFilter:id});
+      mRow.appendChild(btn);
+    }
+    wrap.appendChild(mRow);
+  }
+
+  if(fv.length===0){
+    const empty=el("div",{style:{textAlign:"center",padding:"60px 20px"}});
+    empty.innerHTML=icons.bookmark.replace('width="20" height="20"','width="44" height="44"');
+    empty.querySelector("svg").style.color=C.border;
+    empty.appendChild(el("p",{style:{color:C.muted,fontSize:"0.85rem",lineHeight:"1.8",marginTop:"16px"}},
+      state.vocab.length===0?"まだ用語が保存されていません。\n記事を解析して気になった用語を保存しましょう。":"該当する用語がありません"
+    ));
+    wrap.appendChild(empty);
+  } else {
+    fv.forEach(term=>{
+      const open=state.expandedWord===term.word;
+      const mastered=term.mastered||false;
+      const card=el("div",{style:{background:C.card,border:"1px solid "+(mastered?"#2A4A2A":C.border),borderRadius:"12px",marginBottom:"10px",overflow:"hidden"}});
+      const header=el("div",{style:{padding:"14px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}});
+      header.onclick=()=>setState({expandedWord:open?null:term.word});
+      const hl=el("div",{style:{display:"flex",alignItems:"center",gap:"8px",flex:"1",minWidth:"0"}});
+      hl.appendChild(el("span",{style:{fontFamily:ffS,fontWeight:"700",fontSize:"0.98rem",color:mastered?"#5A8A5A":C.text}},term.word));
+      hl.appendChild(catBadge(term.category));
+      const hr=el("div",{style:{display:"flex",alignItems:"center",gap:"8px",flexShrink:"0"}});
+      const mBtn=el("button",{style:{background:"none",border:"none",cursor:"pointer",color:mastered?"#4CAF82":C.muted,padding:"2px",display:"flex"}});
+      mBtn.innerHTML=(mastered?icons.check:icons.circle).replace('width="16"','width="16"');
+      mBtn.onclick=e=>{e.stopPropagation();toggleMastered(term.word);};
+      const dBtn=el("button",{style:{background:"none",border:"none",cursor:"pointer",color:C.muted,padding:"2px",display:"flex"}});
+      dBtn.innerHTML=icons.trash;
+      dBtn.onclick=e=>{e.stopPropagation();toggleSave(term);};
+      hr.appendChild(mBtn); hr.appendChild(dBtn);
+      hr.appendChild(el("span",{style:{color:C.muted,display:"flex"}},open?el("span",{style:{display:"flex"}},icon("chevUp",16,C.muted)):el("span",{style:{display:"flex"}},icon("chevDown",16,C.muted))));
+      header.appendChild(hl); header.appendChild(hr);
+      card.appendChild(header);
+      if(open){
+        const body=el("div",{style:{padding:"4px 16px 16px",borderTop:"1px solid "+C.border}});
+        body.appendChild(el("p",{style:{fontSize:"0.72rem",color:C.muted,margin:"10px 0 6px"}},"保存日："+( term.savedAt?new Date(term.savedAt).toLocaleDateString("ja-JP"):"不明")));
+        body.appendChild(el("p",{style:{fontSize:"0.82rem",color:C.text,lineHeight:"1.85",margin:"0 0 10px"}},term.explanation));
+        if(term.context){
+          const ctx=el("div",{style:{background:C.surface,borderRadius:"8px",padding:"12px",borderLeft:"2px solid "+C.gold}});
+          const cp=el("p",{style:{fontSize:"0.74rem",color:C.muted,margin:"0",lineHeight:"1.75"}});
+          cp.appendChild(el("span",{style:{color:C.gold,fontWeight:"700"}},"使われ方："));
+          cp.appendChild(document.createTextNode(term.context));
+          ctx.appendChild(cp); body.appendChild(ctx);
+        }
+        card.appendChild(body);
+      }
+      wrap.appendChild(card);
+    });
+  }
+
+  if(state.vocab.length>0){
+    const flashBtn=el("button",{style:{
+      width:"100%",padding:"15px",borderRadius:"12px",cursor:"pointer",
+      background:"transparent",border:"1.5px solid "+C.accent,
+      color:C.accent,fontWeight:"700",fontSize:"0.92rem",fontFamily:ff,
+      display:"flex",alignItems:"center",justifyContent:"center",gap:"8px",marginTop:"24px",
+    }});
+    flashBtn.innerHTML=icons.rotate;
+    flashBtn.appendChild(document.createTextNode(" 復習モードを開始（"+fv.length+"語）"));
+    flashBtn.onclick=()=>setState({vocabMode:"flash",flashIdx:0,flashFlipped:false});
+    wrap.appendChild(flashBtn);
+  }
+  return wrap;
+}
+
+function renderFlash(){
+  const fv=filteredVocab();
+  const wrap=el("div",{style:{padding:"20px",display:"flex",flexDirection:"column",alignItems:"center"}});
+  const topRow=el("div",{style:{width:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"20px"}});
+  const backBtn=el("button",{style:{background:"none",border:"none",color:C.muted,cursor:"pointer",display:"flex",alignItems:"center",gap:"6px",fontSize:"0.8rem",fontFamily:ff}});
+  backBtn.innerHTML=icons.arrowLeft.replace('width="20" height="20"','width="15" height="15"');
+  backBtn.appendChild(document.createTextNode(" 一覧に戻る"));
+  backBtn.onclick=()=>setState({vocabMode:"list"});
+  topRow.appendChild(backBtn);
+  topRow.appendChild(el("span",{style:{fontSize:"0.78rem",color:C.muted,fontFamily:ff}},(state.flashIdx+1)+" / "+fv.length));
+  wrap.appendChild(topRow);
+
+  if(fv.length===0){wrap.appendChild(el("p",{style:{color:C.muted}},"用語がありません"));return wrap;}
+
+  const term=fv[state.flashIdx];
+  const mastered=term.mastered||false;
+
+  const card=el("div",{style:{
+    background:C.card,border:"1px solid "+C.border,borderRadius:"18px",
+    padding:"36px 24px",minHeight:"240px",cursor:"pointer",width:"100%",
+    display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+    textAlign:"center",marginBottom:"20px",
+  }});
+  card.onclick=()=>setState({flashFlipped:!state.flashFlipped});
+
+  if(!state.flashFlipped){
+    card.appendChild(catBadge(term.category));
+    card.appendChild(el("p",{style:{fontFamily:ffS,fontSize:"1.8rem",fontWeight:"700",color:C.text,margin:"20px 0 12px"}},term.word));
+    card.appendChild(el("p",{style:{fontSize:"0.75rem",color:C.muted}},"タップして解説を見る"));
+  } else {
+    card.appendChild(el("p",{style:{fontSize:"0.85rem",color:C.text,lineHeight:"1.85",marginBottom:"14px"}},term.explanation));
+    if(term.context){
+      const ctx=el("div",{style:{background:C.surface,borderRadius:"8px",padding:"12px",borderLeft:"2px solid "+C.gold,textAlign:"left",width:"100%"}});
+      const cp=el("p",{style:{fontSize:"0.74rem",color:C.muted,margin:"0",lineHeight:"1.75"}});
+      cp.appendChild(el("span",{style:{color:C.gold,fontWeight:"700"}},"使われ方："));
+      cp.appendChild(document.createTextNode(term.context));
+      ctx.appendChild(cp); card.appendChild(ctx);
+    }
+  }
+  wrap.appendChild(card);
+
+  const mBtn=el("button",{style:{
+    width:"100%",padding:"13px",borderRadius:"12px",cursor:"pointer",
+    background:mastered?"rgba(76,175,130,0.15)":"transparent",
+    border:"1.5px solid "+(mastered?"#4CAF82":C.border),
+    color:mastered?"#4CAF82":C.muted,fontWeight:"700",fontSize:"0.85rem",fontFamily:ff,
+    display:"flex",alignItems:"center",justifyContent:"center",gap:"6px",marginBottom:"16px",
+  }});
+  mBtn.innerHTML=(mastered?icons.check:icons.circle);
+  mBtn.appendChild(document.createTextNode(mastered?"習得済み✓":"習得済みにする"));
+  mBtn.onclick=()=>toggleMastered(term.word);
+  wrap.appendChild(mBtn);
+
+  const nav=el("div",{style:{display:"flex",gap:"10px",width:"100%"}});
+  const prevBtn=el("button",{style:{
+    flex:"1",padding:"13px",borderRadius:"12px",cursor:state.flashIdx===0?"not-allowed":"pointer",
+    background:"transparent",border:"1px solid "+C.border,
+    color:state.flashIdx===0?C.border:C.muted,fontWeight:"600",fontSize:"0.85rem",fontFamily:ff,
+  }},"← 前へ");
+  prevBtn.onclick=()=>{if(state.flashIdx>0)setState({flashIdx:state.flashIdx-1,flashFlipped:false});};
+  const isLast=state.flashIdx===fv.length-1;
+  const nextBtn=el("button",{style:{
+    flex:"1",padding:"13px",borderRadius:"12px",cursor:"pointer",
+    background:isLast?C.accent:"transparent",border:"1.5px solid "+(isLast?C.accent:C.border),
+    color:isLast?"#fff":C.muted,fontWeight:"600",fontSize:"0.85rem",fontFamily:ff,
+  }},isLast?"完了":"次へ →");
+  nextBtn.onclick=()=>{if(!isLast)setState({flashIdx:state.flashIdx+1,flashFlipped:false});else setState({vocabMode:"list"});};
+  nav.appendChild(prevBtn); nav.appendChild(nextBtn);
+  wrap.appendChild(nav);
+  return wrap;
+}
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+function renderModal(){
+  if(!state.modal) return null;
+  const term=state.modal;
+  const saved=state.vocab.some(v=>v.word===term.word);
+  const overlay=el("div",{style:{
+    position:"fixed",inset:"0",zIndex:"200",background:"rgba(0,0,0,0.72)",
+    backdropFilter:"blur(6px)",display:"flex",alignItems:"flex-end",
+  }});
+  overlay.onclick=()=>setState({modal:null});
+  const sheet=el("div",{style:{
+    background:C.surface,borderRadius:"22px 22px 0 0",padding:"28px 24px 40px",
+    width:"100%",maxWidth:"480px",margin:"0 auto",
+    border:"1px solid "+C.border,borderBottom:"none",fontFamily:ff,
+  }});
+  sheet.onclick=e=>e.stopPropagation();
+
+  if(term.loading){
+    const loading=el("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",padding:"32px"}});
+    loading.innerHTML=icons.loader.replace('width="28" height="28"','width="28" height="28"');
+    loading.querySelector("svg").style.color=C.accent;
+    loading.appendChild(el("p",{style:{color:C.muted,fontSize:"0.85rem",marginTop:"12px"}},"解析中..."));
+    sheet.appendChild(loading);
+  } else {
+    const top=el("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"18px"}});
+    const tl=el("div");
+    tl.appendChild(el("h3",{style:{fontFamily:ffS,fontSize:"1.3rem",color:C.text,margin:"0 0 8px"}},term.word));
+    tl.appendChild(catBadge(term.category||"その他"));
+    const closeBtn=el("button",{style:{background:"none",border:"none",color:C.muted,cursor:"pointer",padding:"4px"}});
+    closeBtn.innerHTML=icons.x;
+    closeBtn.onclick=()=>setState({modal:null});
+    top.appendChild(tl); top.appendChild(closeBtn);
+    sheet.appendChild(top);
+    sheet.appendChild(el("p",{style:{fontSize:"0.88rem",color:C.text,lineHeight:"1.85",marginBottom:"16px"}},term.explanation));
+    if(term.context){
+      const ctx=el("div",{style:{background:C.card,borderRadius:"10px",padding:"14px",borderLeft:"3px solid "+C.gold,marginBottom:"20px"}});
+      const cp=el("p",{style:{fontSize:"0.76rem",color:C.muted,margin:"0",lineHeight:"1.75"}});
+      cp.appendChild(el("span",{style:{color:C.gold,fontWeight:"700"}},"使われ方："));
+      cp.appendChild(document.createTextNode(term.context));
+      ctx.appendChild(cp); sheet.appendChild(ctx);
+    }
+    const saveBtn=el("button",{style:{
+      width:"100%",padding:"15px",borderRadius:"12px",cursor:"pointer",
+      background:saved?"transparent":C.accent,border:"1.5px solid "+C.accent,
+      color:saved?C.accent:"#fff",fontWeight:"700",fontSize:"0.92rem",fontFamily:ff,
+      display:"flex",alignItems:"center",justifyContent:"center",gap:"8px",
+    }});
+    saveBtn.innerHTML=(saved?icons.bookmarkFill:icons.bookmark).replace('width="20" height="20"','width="16" height="16"');
+    saveBtn.appendChild(document.createTextNode(saved?"保存を解除する":"用語集に保存する"));
+    saveBtn.onclick=()=>{toggleSave(term);setState({modal:{...term}});};
+    sheet.appendChild(saveBtn);
+  }
+  overlay.appendChild(sheet);
+  return overlay;
+}
+
+// ── Actions ───────────────────────────────────────────────────────────────────
+async function runAnalysis(){
+  if(!state.pasteText.trim()||state.loading) return;
+  setState({loading:true,errorMsg:null,statusMsg:"テキストを解析中... (失敗時は自動リトライします)"});
+  try{
+    const raw = await callGemini(buildPrompt(state.pasteText,state.analyzeMode),state.apiKey,state.analyzeMode==="summary"?4000:2000);
+    setState({statusMsg:"結果を整理中..."});
+    let parsed;
+    try{parsed=parseJSON(raw);}
+    catch(e){throw new Error("JSON解析失敗。応答: "+raw.substring(0,200));}
+    if(!parsed.terms||parsed.terms.length===0) throw new Error("専門用語が見つかりませんでした。別の記事で試してみてください。");
+    if(!parsed.article_text) parsed.article_text=state.pasteText;
+    setState({loading:false,statusMsg:"",results:parsed,view:"results"});
+  }catch(err){
+    setState({loading:false,statusMsg:"",errorMsg:err.message||"解析に失敗しました。もう一度お試しください。"});
+  }
+}
+
+function toggleSave(term){
+  const exists=state.vocab.some(v=>v.word===term.word);
+  const next=exists?state.vocab.filter(v=>v.word!==term.word):[...state.vocab,{...term,savedAt:new Date().toISOString()}];
+  saveVocab(next);
+  setState({vocab:next});
+}
+
+function toggleMastered(word){
+  const next=state.vocab.map(v=>v.word===word?{...v,mastered:!v.mastered}:v);
+  saveVocab(next);
+  setState({vocab:next});
+}
+
+async function searchWord(){
+  if(!state.wordInput.trim()||state.wordLoading) return;
+  const word=state.wordInput.trim();
+  const existing=state.results?.terms?.find(t=>t.word===word);
+  if(existing){setState({modal:existing,wordInput:""});return;}
+  setState({wordLoading:true,modal:{word,loading:true},wordInput:""});
+  try{
+    const raw=await callGemini(`「${word}」をビジネス用語として社会人向けに解説。JSON形式のみ:\n{"word":"${word}","category":"経済|金融|IT|コンサル|その他のいずれか","explanation":"2〜3文の解説","context":"ビジネスでの一般的な使われ方"}`,state.apiKey);
+    setState({modal:parseJSON(raw),wordLoading:false});
+  }catch{setState({modal:null,wordLoading:false});}
+}
+
+// ── Main Render ───────────────────────────────────────────────────────────────
+function render(){
+  const root=$("root");
+  root.innerHTML="";
+
+  const app=el("div",{style:{fontFamily:ff,background:C.bg,minHeight:"100vh",maxWidth:"480px",margin:"0 auto",color:C.text,paddingBottom:"76px",position:"relative"}});
+
+  // API Setup screen
+  if(state.showApiSetup){
+    // Header
+    const hdr=el("div",{style:{padding:"18px 20px 14px",background:C.surface,borderBottom:"1px solid "+C.border,position:"sticky",top:"0",zIndex:"10"}});
+    hdr.appendChild(el("p",{style:{margin:"0 0 2px",fontSize:"0.6rem",color:C.accent,fontWeight:"700",letterSpacing:"0.12em"}},"NIKKEI VOCAB"));
+    hdr.appendChild(el("h1",{style:{margin:"0",fontSize:"1.15rem",fontWeight:"700",fontFamily:ffS}},"初期設定"));
+    app.appendChild(hdr);
+    app.appendChild(renderApiSetup());
+    root.appendChild(app);
+    return;
+  }
+
+  // Header
+  const hdr=el("div",{style:{padding:"18px 20px 14px",background:C.surface,borderBottom:"1px solid "+C.border,position:"sticky",top:"0",zIndex:"10"}});
+  if(state.tab==="analyze"&&state.view==="results"){
+    const hrow=el("div",{style:{display:"flex",alignItems:"center",gap:"12px"}});
+    const backBtn=el("button",{style:{background:"none",border:"none",color:C.muted,cursor:"pointer",padding:"4px",display:"flex"}});
+    backBtn.innerHTML=icons.arrowLeft;
+    backBtn.onclick=()=>setState({view:"input",pasteText:"",results:null});
+    hrow.appendChild(backBtn);
+    const htxt=el("div");
+    htxt.appendChild(el("p",{style:{margin:"0",fontSize:"0.6rem",color:C.accent,fontWeight:"700",letterSpacing:"0.1em"}},state.results?.summary?"要約＋用語抽出":"用語抽出"));
+    htxt.appendChild(el("h1",{style:{margin:"0",fontSize:"1rem",fontWeight:"700",fontFamily:ffS}},state.results?.summary?`要約 & ${state.results?.terms?.length||0}語`:`${state.results?.terms?.length||0}個の専門用語を検出`));
+    hrow.appendChild(htxt);
+    hdr.appendChild(hrow);
+  } else if(state.tab==="analyze"){
+    hdr.appendChild(el("p",{style:{margin:"0 0 2px",fontSize:"0.6rem",color:C.accent,fontWeight:"700",letterSpacing:"0.12em"}},"NIKKEI VOCAB"));
+    hdr.appendChild(el("h1",{style:{margin:"0",fontSize:"1.15rem",fontWeight:"700",fontFamily:ffS}},"日経記事を解析する"));
+  } else {
+    hdr.appendChild(el("p",{style:{margin:"0 0 2px",fontSize:"0.6rem",color:C.accent,fontWeight:"700",letterSpacing:"0.12em"}},state.vocabMode==="flash"?"REVIEW MODE":"MY VOCABULARY"));
+    hdr.appendChild(el("h1",{style:{margin:"0",fontSize:"1.15rem",fontWeight:"700",fontFamily:ffS}},state.vocabMode==="flash"?"復習モード":"用語集（"+state.vocab.length+"語）"));
+  }
+  app.appendChild(hdr);
+
+  // Content
+  if(state.tab==="analyze") app.appendChild(renderAnalyze());
+  else app.appendChild(renderVocabulary());
+
+  // Tab bar
+  const tabBar=el("div",{style:{position:"fixed",bottom:"0",left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:"480px",background:C.surface,borderTop:"1px solid "+C.border,display:"flex",zIndex:"50"}});
+  for(const {id,label} of [{id:"analyze",label:"解析"},{id:"vocabulary",label:`用語集 (${state.vocab.length})`}]){
+    const active=state.tab===id;
+    const btn=el("button",{style:{flex:"1",padding:"12px 8px 10px",background:"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:"4px",color:active?C.accent:C.muted}});
+    btn.innerHTML=id==="analyze"?icons.zap:icons.bookmark;
+    btn.appendChild(el("span",{style:{fontSize:"0.68rem",fontWeight:active?"700":"400",fontFamily:ff}},label));
+    btn.onclick=()=>setState({tab:id});
+    tabBar.appendChild(btn);
+  }
+  app.appendChild(tabBar);
+
+  // Loading overlay
+  if(state.loading){
+    const ov=el("div",{style:{position:"fixed",inset:"0",background:"rgba(12,15,20,0.92)",zIndex:"300",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",fontFamily:ff}});
+    const sp=el("div",{style:{marginBottom:"20px",color:C.accent}});
+    sp.innerHTML=icons.loader.replace('width="28" height="28"','width="44" height="44"');
+    ov.appendChild(sp);
+    ov.appendChild(el("p",{style:{color:C.text,fontSize:"0.95rem",fontWeight:"600",margin:"0 0 8px"}},"AIが解析中..."));
+    ov.appendChild(el("p",{style:{color:C.muted,fontSize:"0.78rem"}},state.statusMsg||"専門用語を抽出しています"));
+    app.appendChild(ov);
+  }
+
+  // Error banner
+  if(state.errorMsg&&!state.loading){
+    const err=el("div",{style:{position:"fixed",bottom:"80px",left:"50%",transform:"translateX(-50%)",width:"calc(100% - 40px)",maxWidth:"440px",zIndex:"200",background:"#3D1A1A",border:"1px solid #8B2020",borderRadius:"12px",padding:"14px 16px",fontFamily:ff,display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:"12px"}});
+    err.appendChild(el("p",{style:{margin:"0",fontSize:"0.82rem",color:"#FFB3B3",lineHeight:"1.6"}},"⚠️ "+state.errorMsg));
+    const cls=el("button",{style:{background:"none",border:"none",color:"#FF8080",cursor:"pointer",flexShrink:"0",padding:"2px"}});
+    cls.innerHTML=icons.x.replace('width="20" height="20"','width="16" height="16"');
+    cls.onclick=()=>setState({errorMsg:null});
+    err.appendChild(cls);
+    app.appendChild(err);
+  }
+
+  // Modal
+  const modal=renderModal();
+  if(modal) app.appendChild(modal);
+
+  root.appendChild(app);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+render();
+</script>
+</body>
+</html>
