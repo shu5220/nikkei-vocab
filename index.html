@@ -90,7 +90,8 @@ async function callGemini(prompt, apiKey, maxTokens=2000, retries=3){
 function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 
 function parseJSON(text){
-  let s=text.replace(/```json\s*/g,"").replace(/```\s*/g,"").trim();
+  let s=text.replace(/```json[\s\S]*?```/g, m => m.replace(/```json\s*/,"").replace(/```\s*$/,"")).replace(/```\s*/g,"").trim();
+
   try{return JSON.parse(s)}catch{}
   const m=s.match(/\{[\s\S]*\}/);
   if(m){try{return JSON.parse(m[0])}catch{}}
